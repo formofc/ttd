@@ -51,6 +51,22 @@ ttd_bool init_sound_block_trie(sound_block_trie_t* node) {
     return 1;
 }
 
+int escaped(int c) {
+    switch (c) {
+        case 'n': return '\n';
+        case 'b': return '\b';
+        case 't': return '\t';
+        case '\'': return '\'';
+        case '\"': return '\"';
+        case '0': return '\0';
+        case 'r': return '\r';
+        case 'v': return '\v';
+        case 'f': return '\f';
+        case 'a': return '\a';
+        default: return c;
+    }
+}
+
 ttd_bool insert_sound_block_trie(arena_allocator_t* arr, sound_block_trie_t* root, sound_block_t sblock) {
     const char* word;
     unsigned char uc;
@@ -139,6 +155,7 @@ ttd_bool fscan_quoted_string(FILE* f, arena_allocator_t* arr, char** str) {
         if (ch == '\\') { /* escape */
             ch = fgetc(f);
             if (ch == EOF) break;
+            ch = escaped(ch);
         }
 
         if (len + 1 >= capacity) {
