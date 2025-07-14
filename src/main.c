@@ -373,7 +373,11 @@ ttd_bool process_stream(FILE* f, sound_block_trie_t* trie, const char* opt_outpu
     }
 
     if (best_match) {
-        play_range(best_match->file, best_match->start_s, best_match->length_s);
+        if (encoder_inited) { /* no playback */
+            save_range(best_match->file, best_match->start_s, best_match->length_s, &encoder);
+        } else {
+            play_range(best_match->file, best_match->start_s, best_match->length_s);
+        }
     }
     
     success = 1;
