@@ -122,14 +122,14 @@ void arena_free(arena_allocator_t* arr) {
     current = &arr->tail;
 
     while (current && current->capacity) {
-        if (allocated_arena) free(allocated_arena);
+        if (allocated_arena != &arr->tail) free(allocated_arena);
 
         if (current->data) free(current->data);
         current->data = NULL;
         current->size = 0;
         current->capacity = 0;
-        current = current->next;
         allocated_arena = current;
+        current = current->next;
     }
 
     arr->head = NULL;

@@ -8,7 +8,8 @@ A minimalistic text-to-speech (TTS) engine that replaces words with pre-recorded
    - Example: `"hello" "sounds/greeting.wav" 0.5 1.2`  
 2. The program reads **stdin**, matches words, and either:  
    - **Plays** the corresponding audio clips in real-time.  
-   - **Generates** a `.wav` file if `-o output.wav` is specified.  
+   - **Generates** a `.wav` file if `-o output.wav` is specified.
+3. With `-r`/`--random` option TTD will generate random sounds
 
 ### **Why?**  
 - Because sometimes you just need Vladimir Zhirinovsky to read your emails.  
@@ -17,8 +18,9 @@ A minimalistic text-to-speech (TTS) engine that replaces words with pre-recorded
 
 ### **Usage**  
 ```bash
-./ttd config.txt < input.txt           # Play audio live  
+./ttd config.txt < input.txt           # Play audio live
 ./ttd config.txt -o output.wav < input.txt  # Save to file  
+./ttd config.txt -r 25 -o output.wav  # Save to file 25 random sounds
 ```  
 
 ### **Dependencies**  
@@ -27,23 +29,11 @@ A minimalistic text-to-speech (TTS) engine that replaces words with pre-recorded
 
 ### **Build**
 ```
-gcc src/main.c src/miniaudio.c src/sleep.c src/arena_alloc.c -I includes -O3 -ansi -Wall -Wextra -o ttd
+gcc src/main.c src/cli.c src/miniaudio.c src/sleep.c src/arena_alloc.c src/dym_arena_adapter.c src/dir.c -I includes -o ttd -O3 -ansi -Wall -Wextra
 ```
 
 ### **Limitations**  
 - Ouput audio files are **mono, 44.1kHz**.
-
-### **Some important quirks**  
-
-Since **TTD operates on raw bytes** (not "text" in the human sense), it does not understand whitespace, punctuation, or capitalization. This means:  
-
-- If your input has `" hello"`, but the config only maps `"hello"` (no space), then `" hello"` will not trigger the sound.  
-- **Punctuation marks** (`.,!?`) are just bytes—map them explicitly if you want them spoken.  
-- **Capitalization matters**: `"Hello"` ≠ `"hello"` unless you define both.  
-
-To handle spaces, add a silent or spacer sound:  
-```
-" " "silence.wav" 0.0 0.1  
-"," "comma.wav" 0.0 0.3  
-"." "fullstop.wav" 0.0 0.4  
-```  
+- Since **TTD operates on raw bytes** (not "text" in the human sense), it does not understand whitespace, punctuation, or capitalization. This means:  
+    - **Punctuation marks** (`.,!?`) are just bytes—map them explicitly if you want them spoken.  
+    - **Capitalization matters**: `"Hello"` ≠ `"hello"` unless you define both.  

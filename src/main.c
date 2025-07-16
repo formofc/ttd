@@ -2,14 +2,19 @@
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
+#include <time.h>
 
+#include "dym_arena_adapter.h"
 #include "arena_alloc.h"
 #include "miniaudio.h"
+#include "ttd_bool.h"
 #include "sleep.h"
 #include "dym.h"
+#include "cli.h"
+#include "dir.h"
 
-typedef char ttd_bool;
-
+#define ENCODER_BUFFER_SIZE 1024
+#define CWD_BUFFER_SIZE 1024
 #define TTD_MIN(x, y) (x > y ? y : x)
 
 typedef struct {
@@ -18,7 +23,6 @@ typedef struct {
     size_t word_length; /*cached*/ 
     double start_s;
     double length_s;
-
 } sound_block_t;
 
 typedef struct {
@@ -34,11 +38,6 @@ typedef struct sound_block_trie_t {
     ttd_bool is_leaf;
     ttd_bool is_contain;
 } sound_block_trie_t;
-
-typedef struct {
-    const char* opt_output_path;
-    const char* config_path;
-} config_t;
 
 ttd_bool init_sound_block_trie(sound_block_trie_t* node) {
     if (!node) return 0;
@@ -95,12 +94,13 @@ ttd_bool insert_sound_block_trie(arena_allocator_t* arr, sound_block_trie_t* roo
     return 1;
 }
 
-sound_block_t* get_longest_match(sound_block_trie_t* root, const char* word, ttd_bool* opt_is_leaf) {
+sound_block_t* get_longest_match(sound_block_trie_t* root, const char* word, ttd_bool* opt_match_no_chance) {
     sound_block_trie_t* best_match = NULL;
     sound_block_trie_t* current;
     size_t len, i;
     unsigned char uc;
 
+    if (opt_match_no_chance) *opt_match_no_chance = 1;
     if (!root || !word) return NULL;
 
     current = root;
@@ -112,19 +112,31 @@ sound_block_t* get_longest_match(sound_block_trie_t* root, const char* word, ttd
         current = current->children[uc];
         if (current->is_contain) best_match = current;
     }
+    if (opt_match_no_chance) *opt_match_no_chance = (current->is_leaf) || (i < len);
     
     if (!best_match) return NULL;
 
-    if (opt_is_leaf) *opt_is_leaf = (current->is_leaf) || (i < len);
     return &best_match->sblock;
 }
 
-/* Maybe, just maybe i should cache encoders cuz they are BLOATED
-typedef struct {
-    const char* file_name;
-    ma_encoder encoder;
-} encoder_cache_entry;
-*/
+ttd_bool ma_decoder_default_init(ma_decoder* decoder, const char* file_path) {
+    ma_decoder_config decoder_config; 
+
+    if (!decoder || !file_path) return 0;
+
+    decoder_config = ma_decoder_config_init(
+        ma_format_f32,
+        1, /* channels */ 
+        44100
+    );
+
+    if (ma_decoder_init_file(file_path, &decoder_config, decoder) != MA_SUCCESS) {
+        fprintf(stderr, "Failed to inialize encoder for \"%s\"\n", file_path);
+        return 0;
+    }
+
+    return 1;
+}
 
 void skip_whitespace(FILE* f) {
     int ch;
@@ -194,13 +206,50 @@ ttd_bool fscan_sound_block(FILE* f, arena_allocator_t* arr, sound_block_t* out) 
     }
     out->file = str_dummy;
 
-    if (fscanf(f, "%lf %lf", &out->start_s, &out->length_s) != 2) {
+    skip_whitespace(f);
+    if (fscanf(f, "%lf", &out->start_s) != 1) {
+        return 0;
+    }
+
+    skip_whitespace(f);
+    if (fscanf(f, "%lf", &out->length_s) != 1) {
         return 0;
     }
 
     out->word_length = strlen(out->word);
 
     return 1;
+}
+
+ttd_bool goto_file_dir(const char* file_path) {
+    ttd_bool success = 0;
+    arena_allocator_t arr = {0};
+    size_t len;
+    const char* current;
+    char* dir;
+
+    if (!file_path) goto failed;
+
+    current = file_path + strlen(file_path);
+    while (current != file_path) {
+        if (*current == '\\' || *current == '/') {
+            break;
+        }
+        current--;
+    }
+    if (current != file_path) {
+        len = current - file_path;
+        dir = arena_allocate(&arr, len + 1, 1);
+        if (!dir) goto failed;
+        memcpy(dir, file_path, len);
+        dir[len] = '\0';
+        if (ttd_goto_dir(dir) != 0) goto failed;
+    }
+
+    success = 1;
+failed:
+    arena_free(&arr);
+    return success;
 }
 
 void ma_data_callback_play_file(ma_device* device, void* output, const void* input, ma_uint32 frame_count) {
@@ -214,54 +263,46 @@ void ma_data_callback_play_file(ma_device* device, void* output, const void* inp
 }
 
 ttd_bool save_range(const char* file_path, double start_s, double length_s, ma_encoder* encoder) {
-    ttd_bool decoder_inited = 0, success = 0;
-    ma_decoder decoder;
-    ma_decoder_config decoder_config;
+    ttd_bool success = 0, decoder_inited = 0;
     ma_uint64 start_pcm_frame, frames_to_save, frames_saved;
+    ma_decoder decoder;
     float buffer[1024];
 
     if (!file_path || (length_s < 0) || (start_s < 0) || !encoder) return 0;
 
-    decoder_config = ma_decoder_config_init(
-        ma_format_f32,
-        1, /* channels */ 
-        44100
-    );
-
-    if (ma_decoder_init_file(file_path, &decoder_config, &decoder) != MA_SUCCESS) {
-        fprintf(stderr, "Failed to play sound from file\n");
-        goto failure;
+    if (!ma_decoder_default_init(&decoder, file_path)) {
+        fprintf(stderr, "Failed to initialize decoder for saving\n");
+        goto failed;
     }
     decoder_inited = 1;
-    
+
     start_pcm_frame = (ma_uint64)(decoder.outputSampleRate * start_s);
     if (ma_decoder_seek_to_pcm_frame(&decoder, start_pcm_frame) != MA_SUCCESS) {
-        fprintf(stderr, "Failed to play seek audio file\n");
-        goto failure;
+        fprintf(stderr, "Failed to seek audio file\n");
+        goto failed;
     }
     frames_to_save = (ma_uint64)(decoder.outputSampleRate * length_s);
     
     while (frames_to_save) { /* too easy */
         if (ma_decoder_read_pcm_frames(&decoder, (void*)buffer, TTD_MIN(frames_to_save, 1024), &frames_saved) != MA_SUCCESS) {
             fprintf(stderr, "Failed to read samples from file\n");
-            goto failure;
+            goto failed;
         }
         if (ma_encoder_write_pcm_frames(encoder, (void*)buffer, frames_saved, &frames_saved) != MA_SUCCESS) {
             fprintf(stderr, "Failed to write samples to file\n");
-            goto failure;
+            goto failed;
         }
         frames_to_save -= frames_saved;
     }
     
     success = 1;
-failure:
+failed:
     if (decoder_inited) ma_decoder_uninit(&decoder);
-
     return success;
 }
 
 ttd_bool play_range(const char* file_path, double start_s, double length_s) {
-    ttd_bool device_inited = 0, decoder_inited = 0, success = 0;
+    ttd_bool decoder_inited = 0, device_inited = 0, success = 0;
     ma_decoder decoder;
     ma_device device;
     ma_device_config device_config;
@@ -269,16 +310,15 @@ ttd_bool play_range(const char* file_path, double start_s, double length_s) {
 
     if (!file_path || (start_s < 0) || (length_s < 0)) return 0;
 
-    if (ma_decoder_init_file(file_path, NULL, &decoder) != MA_SUCCESS) {
-        fprintf(stderr, "Failed to play sound from file\n");
-        goto failure;
+    if (!ma_decoder_default_init(&decoder, file_path)) {
+        fprintf(stderr, "Failed to initialize decoder for playing\n");
+        goto failed;
     }
-    decoder_inited = 1;
-    
+
     start_pcm_frame = (ma_uint64)(decoder.outputSampleRate * start_s);
     if (ma_decoder_seek_to_pcm_frame(&decoder, start_pcm_frame) != MA_SUCCESS) {
-        fprintf(stderr, "Failed to play seek audio file\n");
-        goto failure;
+        fprintf(stderr, "Failed to seek audio file\n");
+        goto failed;
     }
 
     device_config = ma_device_config_init(ma_device_type_playback); /* just play sound */
@@ -289,7 +329,7 @@ ttd_bool play_range(const char* file_path, double start_s, double length_s) {
     device_config.pUserData = &decoder;
     if (ma_device_init(NULL, &device_config, &device) != MA_SUCCESS) {
         fprintf(stderr, "Failed to initialize audio device\n");
-        goto failure;
+        goto failed;
     }
     device_inited = 1;
 
@@ -299,10 +339,53 @@ ttd_bool play_range(const char* file_path, double start_s, double length_s) {
     ma_device_stop(&device);
     
     success = 1;
-failure:
-    if (device_inited) ma_device_uninit(&device);
+failed:
     if (decoder_inited) ma_decoder_uninit(&decoder);
+    if (device_inited) ma_device_uninit(&device);
 
+    return success;
+}
+
+ttd_bool random_speak(sound_blocks_t sblocks, size_t count, const size_t* opt_seed, const char* opt_output_path) {
+    ttd_bool encoder_inited = 0, success = 0;
+    ma_encoder encoder;
+    ma_encoder_config encoder_config;
+    size_t i, current_random, seed;
+    
+    if (opt_seed) {
+        seed = *opt_seed;
+    } else {
+        seed = time(0);
+        printf("Seed is: %zu\n", seed);
+    }
+    srand(seed);
+
+    if (opt_output_path) { /* init encoder */
+        encoder_config = ma_encoder_config_init(
+                ma_encoding_format_wav,
+                ma_format_f32,
+                1, /* channels */
+                44100
+        );
+        if (ma_encoder_init_file(opt_output_path, &encoder_config, &encoder) != MA_SUCCESS) {
+            fprintf(stderr, "Failed to inialize encoder for \"%s\"\n", opt_output_path);
+            goto failed;
+        }
+        encoder_inited = 1;
+    }
+
+    for (i = 0; i < count; ++i) {
+        current_random = (size_t)rand() % sblocks.size;
+        if (encoder_inited) {
+            save_range(sblocks.data[current_random].file, sblocks.data[current_random].start_s, sblocks.data[current_random].length_s, &encoder);
+        } else {
+            play_range(sblocks.data[current_random].file, sblocks.data[current_random].start_s, sblocks.data[current_random].length_s);
+        }
+    }
+    
+    success = 1;
+failed:
+    if (encoder_inited) ma_encoder_uninit(&encoder);
     return success;
 }
 
@@ -310,7 +393,7 @@ ttd_bool process_stream(FILE* f, sound_block_trie_t* trie, const char* opt_outpu
     int ch;
     ma_encoder encoder;
     ma_encoder_config encoder_config;
-    ttd_bool is_leaf, encoder_inited = 0, success = 0;
+    ttd_bool match_no_chance, encoder_inited = 0, success = 0;
     size_t buffer_size = 64;
     char* buffer;
     size_t buffer_pos = 0, best_length = 0;
@@ -353,11 +436,16 @@ ttd_bool process_stream(FILE* f, sound_block_trie_t* trie, const char* opt_outpu
         buffer[buffer_pos] = '\0';
         
         while (1) {
-            is_leaf = 0;
-            best_match = get_longest_match(trie, buffer, &is_leaf);
-
-            if (!best_match || !is_leaf) break;
-            best_length = best_match->word_length; 
+            best_match = get_longest_match(trie, buffer, &match_no_chance);
+            if (!best_match && match_no_chance) { /* 100% unknown word */
+                memmove(buffer, &buffer[1], buffer_pos - 1);
+                buffer_pos -= 1;
+                buffer[buffer_pos] = '\0';
+                break;
+            }
+            
+            if (!best_match || !match_no_chance) break;
+            best_length = best_match->word_length;
 
             memmove(buffer, &buffer[best_length], buffer_pos - best_length);
             buffer_pos -= best_length;
@@ -387,105 +475,113 @@ failed:
     return success;
 }
 
-void print_help(const char* selfpath) {
-    printf(
-        "Usage:\n"
-        "%s config_path [options]\n"
-        "\"-o\"/\"--output\" FILE - Set output .wav file. No playback\n"
-        "\"-h\"/\"--help\" - Show this help message\n"
-        "\n"
-        "Config file format:\n"
-        "   Each line represents a sound block in the following format:\n"
-        "   \"word\" \"sound_file\" start_time length\n"
-        "   Where:\n"
-        "       word - the text to match\n"
-        "       sound_file - path to audio file\n"
-        "       start_time - start time in seconds\n"
-        "       length - duration in seconds\n"
-        "\n"
-        "Example config line:\n"
-        "   \"hello\" \"sounds/greeting.wav\" 0.5 1.2\n"
-        "\n"
-        "The program reads from stdin and plays matching sound blocks when\n"
-        "text patterns are found.\n"
-        "Warning: audio file paths are relative to current working directory, not config file location\n",
-        selfpath
-    );
-}
-
-ttd_bool parse_config(config_t* config, int argc, char** argv) {
-    const char* selfpath;
-
-    if (!config || !argc || !argv) return 0;
-
-    selfpath = *argv++;
-    --argc;
-
-    config->config_path = NULL;
-    config->opt_output_path = NULL;
-
-    while (*argv) {
-        if ((strcmp(*argv, "-o") == 0) || (strcmp(*argv, "--output") == 0)) {
-            ++argv;
-            --argc;
-            if (!*argv) {
-                fprintf(stderr, "provide real file path for output\n");
-                return 0;
-            }
-            config->opt_output_path = *argv;
-        } else if ((strcmp(*argv, "-h") == 0) || (strcmp(*argv, "--help") == 0)) {
-            print_help(selfpath);
-            return 0;
-        } else {
-            config->config_path = *argv;
-        }
-        ++argv;
-        --argc;
-    }
-
-    if (!config->config_path) return 0;
-
-    return 1;
-}
-
-int main(int argc, char** argv) {
-    config_t config;
+ttd_bool main_process_stream(const char* config_path, const char* opt_output_path) {
     arena_allocator_t arr = {0};
-    FILE* f;
+    FILE* f = NULL;
+    size_t current_sblock_id = 0;
     sound_block_t current_sblock;
     sound_block_trie_t trie;
+    ttd_bool success = 0;
+    char cwd_last_buffer[CWD_BUFFER_SIZE] = {0};
 
-    if (!parse_config(&config, argc, argv)) return EXIT_FAILURE;
-    
-    f = fopen(config.config_path, "r");
+    if (!config_path) goto failed;
+
+    f = fopen(config_path, "r");
     if (!f) {
         fprintf(stderr, "Failed to open file\n");
-        return EXIT_FAILURE;
+        goto failed;
     }
+
+    if (!ttd_current_dir(cwd_last_buffer, CWD_BUFFER_SIZE)) goto failed;
+    if (!goto_file_dir(config_path)) goto failed;
     
     init_sound_block_trie(&trie);
     while (1) {
         skip_whitespace(f);
         if (feof(f)) break; 
         
-        int c = fgetc(f);
-        ungetc(c, f);
         if (!fscan_sound_block(f, &arr, &current_sblock)) {
-            fprintf(stderr, "Failed to scan file\n");
-            return EXIT_FAILURE;
+            fprintf(stderr, "Failed to scan file on block %zu\n", current_sblock_id);
+            goto failed;
         }
         /* printf("Insert `%s`\n", current_sblock.word); */
         if (!insert_sound_block_trie(&arr, &trie, current_sblock)) {
             fprintf(stderr, "Failed to insert \"%s\"\n", current_sblock.word);
+            /* non fatal error */
         }
-        /* printf("Block scaned\n"); */
+        ++current_sblock_id;
     }
-    fclose(f);
     
-    if (!process_stream(stdin, &trie, config.opt_output_path)) {
+    if (!process_stream(stdin, &trie, opt_output_path)) {
         fprintf(stderr, "Failed to parse stdin\n");
-        return 1;
+        goto failed;
     }
 
-    return 0;
+    success = 1;
+failed:
+    if (cwd_last_buffer[0]) ttd_goto_dir(cwd_last_buffer);
+    if (f) fclose(f);
+    arena_free(&arr);
+    return success;
+
+}
+
+ttd_bool main_random_speak(const char* config_path, size_t count, const char* opt_output_path) {
+    arena_allocator_t arr = {0};
+    FILE* f = NULL;
+    ttd_bool success = 0;
+    sound_blocks_t sblocks = {0};
+    sound_block_t current_sblock;
+    char cwd_last_buffer[CWD_BUFFER_SIZE] = {0};
+
+    if (!config_path) goto failed;
+
+    f = fopen(config_path, "r");
+    if (!f) {
+        fprintf(stderr, "Failed to open config file\n");
+        goto failed;
+    }
+
+    if (!ttd_current_dir(cwd_last_buffer, CWD_BUFFER_SIZE)) goto failed;
+    if (!goto_file_dir(config_path)) goto failed;
+    
+    while (1) {
+        skip_whitespace(f);
+        if (feof(f)) break; 
+        
+        if (!fscan_sound_block(f, &arr, &current_sblock)) {
+            fprintf(stderr, "Failed to scan file on block %zu\n", sblocks.size);
+            goto failed;
+        }
+        dym_push_e(&sblocks, current_sblock, dym_arena_allocate, &arr, (void), 0);
+    }
+    if (!random_speak(sblocks, count, NULL, opt_output_path)) {
+        fprintf(stderr, "Failed to random speak\n");
+        goto failed;
+    }
+
+    success = 1;
+failed:
+    if (cwd_last_buffer[0]) ttd_goto_dir(cwd_last_buffer);
+    if (f) fclose(f);
+    arena_free(&arr);
+    return success;
+}
+
+
+int main(int argc, char** argv) {
+    ttd_bool success = 0;
+    config_t config;
+
+    if (!parse_config(&config, argc, argv)) goto failed;
+    
+    if (config.random_speak) {
+        if (!main_random_speak(config.config_path, config.random_speak_count, config.opt_output_path)) goto failed;
+    } else {
+        if (!main_process_stream(config.config_path, config.opt_output_path)) goto failed;
+    }
+
+    success = 1;
+failed:
+    return success ? EXIT_SUCCESS : EXIT_FAILURE;
 }
